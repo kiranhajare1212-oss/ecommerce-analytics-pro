@@ -1,0 +1,285 @@
+name: E-Commerce Analytics Pipeline
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:           # allow manual trigger from GitHub UI
+  schedule:
+    - cron: '0 2 * * 1'       # every Monday at 02:00 UTC (weekly refresh)
+
+jobs:
+  # ── JOB 1: Validate SQL ─────────────────────────────────────
+  validate-sql:
+    name: Validate SQL Files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Syntax-check SQL via sqlite3
+        run: |
+          python - <<'EOF'
+          import sqlite3, pathlib, sys
+
+          conn = sqlite3.connect(":memory:")
+          errors = []
+
+          # Only validate schema + views — analytics queries need data loaded first
+          for f in ["sql/01_schema.sql", "sql/03_views.sql"]:
+              path = pathlib.Path(f)
+              if not path.exists():
+                  errors.append(f"MISSING: {f}")
+                  continue
+              stmts = path.read_text().split(";")
+              for stmt in stmts:
+                  stmt = stmt.strip()
+                  if not stmt or stmt.startswith("--"):
+                      continue
+                  try:
+                      conn.execute(stmt)
+                  except sqlite3.OperationalError as e:
+                      err_msg = str(e)
+                      # Ignore "already exists" — expected on re-run
+                      if "already exists" not in err_msg:
+                          errors.append(f"{f}: {err_msg}")
+
+          if errors:
+              print("❌ SQL validation failed:")
+              for e in errors:
+                  print(f"   {e}")
+              sys.exit(1)
+          else:
+              print("✅ SQL validation passed")
+          EOF
+
+  # ── JOB 2: Run Full Pipeline ─────────────────────────────────
+  run-pipeline:
+    name: Generate Data & Reports
+    runs-on: ubuntu-latest
+    needs: validate-sql
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate synthetic dataset
+        run: cd python && python 01_generate_data.py
+
+      - name: Run EDA & build SQLite DB
+        run: cd python && python 02_eda_analysis.py
+
+      - name: Build Excel report
+        run: cd python && python 03_excel_report.py
+
+      - name: Run advanced analytics
+        run: cd python && python 04_advanced_analytics.py
+
+      - name: Build HTML dashboard
+        run: cd python && python 05_html_dashboard.py
+
+      - name: Verify output files exist
+        run: |
+          python - <<'EOF'
+          import pathlib, sys
+          required = [
+              "data/customers.csv",
+              "data/orders.csv",
+              "data/products.csv",
+              "data/order_items.csv",
+              "data/returns.csv",
+              "data/ecommerce.db",
+              "data/analysis_outputs/rfm_scores.csv",
+              "data/analysis_outputs/cohort_retention.csv",
+              "data/analysis_outputs/revenue_forecast.csv",
+              "data/analysis_outputs/churn_predictions.csv",
+              "data/analysis_outputs/clv_predictions.csv",
+              "data/analysis_outputs/churn_model_metrics.json",
+              "excel/ecommerce_analytics_report.xlsx",
+              "docs/analytics_dashboard.html",
+          ]
+          missing = [f for f in required if not pathlib.Path(f).exists()]
+          if missing:
+              print("❌ Missing output files:")
+              for f in missing: print(f"   {f}")
+              sys.exit(1)
+          print(f"✅ All {len(required)} output files verified")
+          EOF
+
+      - name: Print pipeline summary
+        run: |
+          python - <<'EOF'
+          import pandas as pd, json, pathlib
+
+          orders   = pd.read_csv("data/orders.csv")
+          products = pd.read_csv("data/products.csv")
+          with open("data/analysis_outputs/churn_model_metrics.json") as f:
+              cm = json.load(f)
+
+          delivered = orders[orders["status"] != "Cancelled"]
+          print("=" * 55)
+          print("  PIPELINE SUMMARY")
+          print("=" * 55)
+          print(f"  Total orders    : {len(orders):,}")
+          print(f"  Total revenue   : ₹{delivered['order_total'].sum()/1e7:.2f} Cr")
+          print(f"  Active products : {products['is_active'].sum()}")
+          print(f"  Churn model F1  : {cm['f1_score']:.3f}")
+          print(f"  Churn accuracy  : {cm['accuracy']*100:.2f}%")
+          print("=" * 55)
+          EOF
+
+      - name: Upload Excel report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: excel-report
+          path: excel/ecommerce_analytics_report.xlsx
+          retention-days: 30
+
+      - name: Upload HTML dashboard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-dashboard
+          path: docs/analytics_dashboard.html
+          retention-days: 30
+
+      - name: Upload analysis CSVs
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-outputs
+          path: data/analysis_outputs/
+          retention-days: 30
+
+  # ── JOB 3: Data Quality Checks ───────────────────────────────
+  data-quality:
+    name: Data Quality Checks
+    runs-on: ubuntu-latest
+    needs: run-pipeline
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Re-generate data for quality checks
+        run: |
+          cd python
+          python 01_generate_data.py
+          python 02_eda_analysis.py
+
+      - name: Run data quality assertions
+        run: |
+          python - <<'EOF'
+          import pandas as pd
+          import sys
+
+          failures = []
+
+          # Load data
+          customers   = pd.read_csv("data/customers.csv")
+          products    = pd.read_csv("data/products.csv")
+          orders      = pd.read_csv("data/orders.csv",      parse_dates=["order_date"])
+          order_items = pd.read_csv("data/order_items.csv")
+          returns     = pd.read_csv("data/returns.csv")
+
+          # ── COMPLETENESS ──────────────────────────────────────
+          if customers["customer_id"].isna().any():
+              failures.append("customers: null customer_id values")
+          if orders["order_id"].isna().any():
+              failures.append("orders: null order_id values")
+          if order_items["product_id"].isna().any():
+              failures.append("order_items: null product_id values")
+
+          # ── UNIQUENESS ────────────────────────────────────────
+          if customers["customer_id"].duplicated().any():
+              failures.append("customers: duplicate customer_ids")
+          if orders["order_id"].duplicated().any():
+              failures.append("orders: duplicate order_ids")
+          if customers["email"].duplicated().any():
+              failures.append("customers: duplicate emails")
+
+          # ── REFERENTIAL INTEGRITY ─────────────────────────────
+          orphan_orders = ~orders["customer_id"].isin(customers["customer_id"])
+          if orphan_orders.any():
+              failures.append(f"orders: {orphan_orders.sum()} orders with missing customer_id")
+
+          orphan_items = ~order_items["order_id"].isin(orders["order_id"])
+          if orphan_items.any():
+              failures.append(f"order_items: {orphan_items.sum()} items with missing order_id")
+
+          # ── VALID VALUES ──────────────────────────────────────
+          valid_statuses = {"Delivered", "Shipped", "Processing", "Cancelled"}
+          invalid_statuses = ~orders["status"].isin(valid_statuses)
+          if invalid_statuses.any():
+              failures.append(f"orders: {invalid_statuses.sum()} rows with invalid status")
+
+          if (products["selling_price"] <= 0).any():
+              failures.append("products: selling_price must be > 0")
+          if (products["cost_price"] <= 0).any():
+              failures.append("products: cost_price must be > 0")
+          if (order_items["quantity"] <= 0).any():
+              failures.append("order_items: quantity must be > 0")
+          if (order_items["line_total"] < 0).any():
+              failures.append("order_items: line_total must be >= 0")
+
+          # ── BUSINESS LOGIC ────────────────────────────────────
+          delivered = orders[orders["status"] == "Delivered"]
+          if delivered["delivery_date"].isna().any():
+              n = delivered["delivery_date"].isna().sum()
+              failures.append(f"orders: {n} Delivered orders with null delivery_date")
+
+          return_orders = set(returns["order_id"])
+          delivered_ids = set(orders[orders["status"] == "Delivered"]["order_id"])
+          invalid_returns = return_orders - delivered_ids
+          if invalid_returns:
+              failures.append(f"returns: {len(invalid_returns)} returns for non-delivered orders")
+
+          # ── RANGES ────────────────────────────────────────────
+          if not (1 <= products["rating"]).all() or not (products["rating"] <= 5).all():
+              failures.append("products: rating out of range [1, 5]")
+          if not (0 <= order_items["discount_pct"]).all() or not (order_items["discount_pct"] <= 0.20).all():
+              failures.append("order_items: discount_pct out of range [0, 0.20]")
+
+          # ── VOLUME SANITY ─────────────────────────────────────
+          if len(customers) < 1000:
+              failures.append(f"customers: expected ≥1000, got {len(customers)}")
+          if len(orders) < 5000:
+              failures.append(f"orders: expected ≥5000, got {len(orders)}")
+
+          # ── REPORT ────────────────────────────────────────────
+          print(f"Data Quality Report")
+          print(f"{'='*55}")
+          print(f"  Customers   : {len(customers):,}")
+          print(f"  Products    : {len(products):,}")
+          print(f"  Orders      : {len(orders):,}")
+          print(f"  Order Items : {len(order_items):,}")
+          print(f"  Returns     : {len(returns):,}")
+          print(f"{'='*55}")
+
+          if failures:
+              print(f"\n❌ {len(failures)} data quality issue(s) found:")
+              for f in failures:
+                  print(f"   • {f}")
+              sys.exit(1)
+          else:
+              print(f"\n✅ All data quality checks passed")
+          EOF
